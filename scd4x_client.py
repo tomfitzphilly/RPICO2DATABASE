@@ -1,79 +1,125 @@
-import sqlite3
+import network
 import socket
 import json
-from datetime import datetime
-# import threading
-sensor_data = {}
-# Database setup
-def init_database():
-    conn = sqlite3.connect('sensor_data.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS sensor_readings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            co2 REAL NOT NULL,
-            device_id TEXT NOT NULL,
-            timestamp DATETIME NOT NULL,
-            temperature REAL NOT NULL,
-            humidity REAL NOT NULL
-        )
-    ''')
-    conn.commit()
-    conn.close()
+import time
+from machine import Pin, I2C
+from scd4x import SCD4X
 
-def store_reading(sensor_data): 
-    # key_list = ('co2', 'device_id', 'timestamp', 'temperature', 'humidity')
-    print(" store_dict is: ", sensor_data) 
-    
-    conn = sqlite3.connect('sensor_data.db')
-    cursor = conn.cursor()
-    cursor.execute('''INSERT INTO sensor_readings (co2, device_id, timestamp, 
-                temperature, humidity) VALUES (?, ?, ?, ?, ?)''', (sensor_data['co2'], 
-                sensor_data['device_id'], sensor_data['timestamp'], sensor_data['temperature'], 
-                sensor_data['humidity']))
+# Network configuration
+WIFI_SSID = "your_wifi_ssid"
+WIFI_PASSWORD = "your_wifi_password"
+SERVER_IP = "your_server_ip"  # Replace with your Raspberry Pi 3's IP address
+SERVER_PORT = 8080
+DEVICE_ID = "pico_1"  # Change this for each Pico (pico_1, pico_2, pico_3)
 
-    conn.commit()
-    cursor.close()
-    conn.close()
+# Sensor configuration
+ALTITUDE = 0  # Set your altitude in meters for accurate readings
+TEMP_OFFSET = 0.0  # Set temperature offset if needed (e.g., 2.0 for 2°C)
+MEASUREMENT_INTERVAL = 5  # Seconds between measurements
 
-def handle_client(client_socket, addr):
+# Initialize I2C for SCD4X
+i2c = I2C(0, scl=Pin(17), sda=Pin(16))  # Use appropriate GPIO pins
+scd4x = SCD4X(i2c)
+
+def setup_sensor():
+    """Initialize and configure the SCD4X sensor."""
     try:
-        while True:
-            data = client_socket.recv(1024)
-            print("incoming data is: ", str(data))
-            print("Data type: ", type(data))
-            
-            if not data:
-                break
-            
-            try:
-                sensor_data = json.loads(data)
-                print("handle client reading is : ", str(sensor_data))
-                store_reading(sensor_data)
-                client_socket.send(b'OK')
-            except json.JSONDecodeError:
-                client_socket.send(b'ERROR: Invalid JSON')
-            except KeyError:
-                client_socket.send(b'ERROR: Missing required fields')
+        # Stop any previous measurements
+        scd4x.stop_periodic_measurement()
+        time.sleep_ms(500)
+        
+        # Configure sensor settings
+        scd4x.set_altitude(ALTITUDE)
+        scd4x.set_temperature_offset(TEMP_OFFSET)
+        scd4x.set_auto_calibration(True)
+        
+        # Start periodic measurements
+        scd4x.start_periodic_measurement()
+        print("SCD4X sensor initialized successfully")
+        return True
     except Exception as e:
-        print(f"Error handling client {addr}: {e}")
-    finally:
-        client_socket.close()
+        print("Error initializing sensor:", e)
+        return False
+
+def connect_wifi():
+    """Connect to WiFi network."""
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print('Connecting to WiFi...')
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+        while not wlan.isconnected():
+            time.sleep(1)
+    print('WiFi connected:', wlan.ifconfig())
+    return wlan
+
+def send_data(sock, data):
+    """Send data to server and receive response."""
+    try:
+        sock.send(json.dumps(data).encode())
+        response = sock.recv(1024).decode()
+        return response == 'OK'
+    except Exception as e:
+        print('Error sending data:', e)
+        return False
+
+def read_sensor():
+    """Read data from SCD4X sensor."""
+    if scd4x.get_data_ready():
+        measurement = scd4x.read_measurement()
+        if measurement is not None:
+            co2, temperature, humidity = measurement
+            return {
+                'device_id': DEVICE_ID,
+                'timestamp': time.time(),
+                'temperature': round(temperature, 2),
+                'humidity': round(humidity, 1),
+                'co2': round(co2)
+            }
+    return None
 
 def main():
-    init_database()
+    # Initialize sensor
+    if not setup_sensor():
+        print("Failed to initialize sensor. Exiting...")
+        return
     
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind(('0.0.0.0', 8080))
-    server_socket.listen(5)
+    # Connect to WiFi
+    wlan = connect_wifi()
     
-    print("Server listening on port 8080...")
-    
+    # Main loop
     while True:
-        client_socket, addr = server_socket.accept()
-        print(f"New connection from {addr}")
-        handle_client(client_socket, addr)
-        store_reading(sensor_data)
+        try:
+            # Create new socket connection
+            sock = socket.socket()
+            sock.connect((SERVER_IP, SERVER_PORT))
+            print("Connected to server")
+            
+            while True:
+                # Read sensor data
+                data = read_sensor()
+                
+                if data:
+                    if send_data(sock, data):
+                        print(f"Data sent - CO2: {data['co2']} ppm, "
+                              f"Temp: {data['temperature']}°C, "
+                              f"Humidity: {data['humidity']}%")
+                    else:
+                        print("Failed to send data")
+                        break
+                else:
+                    print("No valid reading available")
+                
+                time.sleep(MEASUREMENT_INTERVAL)
+                
+        except Exception as e:
+            print('Connection error:', e)
+            time.sleep(5)  # Wait before reconnecting
+        finally:
+            try:
+                sock.close()
+            except:
+                pass
 
 if __name__ == '__main__':
     main()
